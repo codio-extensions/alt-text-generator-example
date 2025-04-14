@@ -1,8 +1,8 @@
 {
-  "name": "Custom Assistant Example",
+  "name": "Custom Assistant Example - Generate Alt text for each image in an assignment",
   "type": "helper",
   "properties": {
-    "user_type": "all", 
+    "user_type": "instructor", 
     "component": "all"
   }
 }
