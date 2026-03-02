@@ -1,159 +1,183 @@
-// Wrapping the whole extension in a JS function 
+// Wrapping the whole extension in a JS function
 // (ensures all global variables set in this extension cannot be referenced outside its scope)
-(async function(codioIDE, window) {
-  
-  // Refer to Anthropic's guide on system prompts here: https://docs.anthropic.com/claude/docs/system-prompts
-  const systemPrompt = "You are a helpful assistant with an expertise at writing alt text for images. Your response must always be in plain English, a sentence or a paragraph of 3-4 sentences, with no new lines and no bullet points."
-  
-  // register(id: unique button id, name: name of button visible in Coach, function: function to call when button is clicked) 
-  codioIDE.coachBot.register("altTextGenButton", "Generate Alt text for all images", onButtonPress)
+(async function (codioIDE, window) {
 
-  // function called when I have a question button is pressed
+  // Refer to Anthropic's guide on system prompts here: https://docs.anthropic.com/claude/docs/system-prompts
+  const systemPrompt =
+    "You are a helpful assistant with an expertise at writing alt text for images. Your response must always be in plain English, a sentence or a paragraph of 3-4 sentences, with no new lines and no bullet points.";
+
+  // register(id: unique button id, name: name of button visible in Coach, function: function to call when button is clicked)
+  codioIDE.coachBot.register("altTextGenButton", "Generate Alt text for all images", onButtonPress);
+
   async function onButtonPress() {
-    
     codioIDE.coachBot.write(`Generating alt text for ya my bestie... give me a sec and I'll get started!`);
 
     // Get guideStructure to extract pages
-    const guidesStructure = await codioIDE.guides.structure.getStructure()
-    console.log("This is the guides structure", guidesStructure)
+    const guidesStructure = await codioIDE.guides.structure.getStructure();
+    console.log("This is the guides structure", guidesStructure);
 
     const findPagesFilter = (obj) => {
-        if (!obj || typeof obj !== 'object') return [];
-        
-        return [
-            ...(obj.type === 'page' ? [obj] : []),
-            ...Object.values(obj).flatMap(findPagesFilter)
-        ];
+      if (!obj || typeof obj !== "object") return [];
+      return [
+        ...(obj.type === "page" ? [obj] : []),
+        ...Object.values(obj).flatMap(findPagesFilter),
+      ];
     };
 
-    const pages = findPagesFilter(guidesStructure)
-    // console.log("pages", pages)
+    const pages = findPagesFilter(guidesStructure);
 
-    // // Regex pattern to find images in markdown ![alt text](image_path)
-    // // const pattern = /!\[(.*)\]\((\.guides\/img\/.*)\)/
-    const pattern = /!\[.*?\]\(.*?\)/g
+    // Newline-safe markdown image regex:
+    // - matches ![...](path) even if alt text contains newlines
+    // - captures the path in match[1]
+    // - supports optional markdown title: ![alt](path "title")
+    const pattern = /!\[[\s\S]*?\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
     // aws lambda function url
-    const lambdaUrl = 'https://wrib7ayaikuoognvwh4xjlqtim0zunnd.lambda-url.us-east-2.on.aws/';
+    const lambdaUrl = "https://wrib7ayaikuoognvwh4xjlqtim0zunnd.lambda-url.us-east-2.on.aws/";
+
+    // helper: extension -> mime subtype normalization
+    function getFileExtension(filePath) {
+      const baseName = filePath.split(/[\\/]/).pop();
+      const dotIndex = baseName.lastIndexOf(".");
+      return dotIndex >= 0 ? baseName.slice(dotIndex + 1) : "";
+    }
+
+    function normalizeImageSubtype(ext) {
+      let imageType = (ext || "").toLowerCase();
+      if (imageType === "jpg") imageType = "jpeg";
+      if (imageType === "svg") imageType = "svg+xml";
+      if (!imageType) imageType = "png";
+      return imageType;
+    }
+
+    // helper: sanitize model output so it can't break markdown / future parsing
+    function sanitizeAltText(text) {
+      return (text ?? "")
+        .toString()
+        .replace(/[\r\n]+/g, " ")  // remove newlines
+        .replace(/\s+/g, " ")      // collapse whitespace
+        .replace(/[\[\]]/g, "")    // remove square brackets (markdown-structure breakers)
+        .trim();
+    }
 
     // extract page content for each guide page
-    for ( const element_index in pages) {
-      let pageNumber = parseInt(element_index)+1
-      let page_id = pages[element_index].id
-      // console.log("Page id: ", page_id)
-      let pageData = await codioIDE.guides.structure.get(page_id)
-      let pageContent = pageData.settings.content
-      let pageTitle = pages[element_index].title
-      codioIDE.coachBot.write(`Searching on page ${pageNumber}: ${pageTitle}`);
-      console.log(`Searching on page ${pageNumber}: ${pageTitle}`)
+    for (const element_index in pages) {
+      const pageNumber = parseInt(element_index, 10) + 1;
+      const page_id = pages[element_index].id;
 
-      //Search for markdown formatting of images on this page
+      const pageData = await codioIDE.guides.structure.get(page_id);
+      let pageContent = pageData.settings.content;
+      const pageTitle = pages[element_index].title;
+
+      codioIDE.coachBot.write(`Searching on page ${pageNumber}: ${pageTitle}`);
+      console.log(`Searching on page ${pageNumber}: ${pageTitle}`);
+
+      // Search for markdown formatting of images on this page
       const matches = [...pageContent.matchAll(pattern)];
 
       if (matches.length > 0) {
-        console.log("matches object", matches)
+        console.log("matches object", matches);
         codioIDE.coachBot.write(`Found ${matches.length} images on this page!`);
-        
-        let alt_text_replacements = []
 
-        let matchCount = 0
-        // for each match, extract filepath and alt text sections
+        const alt_text_replacements = [];
 
-        await Promise.all(matches.map(async (match, matchCount) => {
-          matchCount += 1
-          console.log(`This is match object ${matchCount}: ${match[0]}`)
-          
-          console.log("Page id with matches: ", page_id)
+        // Process each match, but never fail the whole page if one image errors
+        const results = await Promise.allSettled(
+          matches.map(async (match, idx) => {
+            try {
+              // IMPORTANT FIX: filepath is captured by the regex in match[1]
+              const filepath = (match[1] || "").trim();
+              if (!filepath) {
+                throw new Error("Could not extract image filepath from markdown.");
+              }
 
-          const og_alt_text_match = match[0].match(/(?<=\[)(.*?)(?=\])/)
-          const og_filepath_match = match[0].match(/(?<=\()(.*?)(?=\))/)
+              // converting img to base64 (this can throw if file not found)
+              const imgFile = await window.codioIDE.files.getFileBase64(filepath);
 
-          // console.log("og alt text", og_alt_text_match[0])
-          // console.log("filepath", og_filepath_match[0])
+              const ext = getFileExtension(filepath);
+              const imageSubtype = normalizeImageSubtype(ext);
 
-          // converting img to base64
-          const filepath = og_filepath_match[0]    
-          const imgFile = await window.codioIDE.files.getFileBase64(filepath)
-          // console.log("base 64 data", imgFile)
+              const postData = { imgData: imgFile };
+              const options = {
+                method: "POST",
+                body: JSON.stringify(postData),
+              };
 
-          // prepare parameters of http post request to aws lambda
-          function getFileExtension(filePath) {
-            const baseName = filePath.split(/[\\/]/).pop();
-            const dotIndex = baseName.lastIndexOf('.');
-            return baseName.slice(dotIndex + 1);
-          }
+              const params = new URLSearchParams({
+                prompt: `This image is on a page titled: ${pageTitle} Provide only the alt text for this image. Respond with clarity and brevity.`,
+                systemPrompt: systemPrompt,
+                mediaType: `image/${imageSubtype}`,
+              });
 
-          const imageType = getFileExtension(filepath)
-          // console.log(imageType)
+              const urlWithParams = `${lambdaUrl}?${params.toString()}`;
 
-          const postData = {
-            "imgData": imgFile
-          };
+              const fetchRequest = await fetch(urlWithParams, options);
+              if (!fetchRequest.ok) {
+                throw new Error(`HTTP error! status: ${fetchRequest.status}`);
+              }
 
-          const options = {
-            method: 'POST',
-            body: JSON.stringify(postData),
-          };
+              const data = await fetchRequest.json();
 
-          const params = new URLSearchParams({
-            prompt: `This image is on a page titled: ${pageTitle} 
-            Provide only the alt text for this image. Respond with clarity and brevity.`,
-            systemPrompt: systemPrompt,
-            mediaType: `image/${imageType}`
-          });
-          
-          console.log("These are the params", params.toString)
+              // IMPORTANT FIX: sanitize so alt text can't break markdown on later runs
+              let llmResponse = sanitizeAltText(data.responseText);
 
-          // set up url with query string params
-          const urlWithParams = `${lambdaUrl}?${params.toString()}`;
-          // console.log(urlWithParams)
+              if (!llmResponse) {
+                throw new Error("Empty alt-text returned by model.");
+              }
 
-          try {
-            const fetchRequest = await fetch(urlWithParams, options);
-            if (!fetchRequest.ok) {
-              throw new Error(`HTTP error! status: ${fetchRequest.status}`);
+              alt_text_replacements.push({
+                og_match_string: match[0],
+                updated_with_alt_text: `![${llmResponse}](${filepath})`,
+              });
+
+              return { ok: true, idx, filepath };
+            } catch (error) {
+              console.error(
+                `Alt-text generation failed for image #${idx + 1} on page "${pageTitle}":`,
+                error
+              );
+
+              // Tell the user *which* image failed, but continue processing
+              codioIDE.coachBot.write(
+                `⚠️ Skipping one image on this page (image #${idx + 1}) because of an error: ${error?.message || error}`
+              );
+
+              return { ok: false, idx, error: error?.message || String(error) };
             }
-            const data = await fetchRequest.json();
-            const llmResponse = data.responseText;
-            
-            alt_text_replacements.push({
-              "og_match_string": match[0],
-              "updated_with_alt_text": `![${llmResponse}](${filepath})`
-            });
-          } catch (error) {
-            console.error('Error fetching data:', error);
-          }
-        }));
+          })
+        );
 
-        console.log("Here are the alt text replacements", alt_text_replacements)
+        console.log("Promise results (settled)", results);
+        console.log("Here are the alt text replacements", alt_text_replacements);
 
-        // now let's replace the alt text in the original content page and update it
-        for (const match of alt_text_replacements) {
-          // console.log("match_string", match.og_match_string)
-          // console.log("alt text rep", match.updated_with_alt_text)
-          pageContent = pageContent.replace(match.og_match_string, match.updated_with_alt_text)
+        // Replace all occurrences of each original match
+        for (const rep of alt_text_replacements) {
+          pageContent = pageContent.split(rep.og_match_string).join(rep.updated_with_alt_text);
         }
-        console.log("updated page content", pageContent)
-        
+
+        console.log("updated page content", pageContent);
+
         try {
-          console.log("Page id for updates: ", page_id)
+          console.log("Page id for updates: ", page_id);
           const updateRes = await window.codioIDE.guides.structure.update(page_id, {
             title: pageTitle,
-            content: pageContent
-          })
-          console.log('item updated', updateRes)
+            content: pageContent,
+          });
+          console.log("item updated", updateRes);
         } catch (e) {
-          console.error(e)
+          console.error(e);
         }
 
         codioIDE.coachBot.write(`Alt text for images on this page is updated! Moving on...`);
       } else {
-        console.log("No matches on this page")
+        console.log("No matches on this page");
         codioIDE.coachBot.write(`No images here, let's move on...`);
       }
-    }    
+    }
+
     codioIDE.coachBot.write(`All images in this assignment have been processed! 🐣`);
-    codioIDE.coachBot.showMenu()
+    codioIDE.coachBot.showMenu();
   }
-// calling the function immediately by passing the required variables
-})(window.codioIDE, window)
+
+  // calling the function immediately by passing the required variables
+})(window.codioIDE, window);
