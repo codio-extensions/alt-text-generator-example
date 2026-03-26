@@ -34,7 +34,7 @@
     function isMeaningfulAltText(altText) {
       const trimmed = altText.trim()
       if (trimmed.length === 0) return false
-      if (trimmed.length < 20) return false
+      if (trimmed.length < 30) return false
       if (GENERIC_ALT_TERMS.test(trimmed)) return false
       if (FILENAME_PATTERN.test(trimmed)) return false
       return true
