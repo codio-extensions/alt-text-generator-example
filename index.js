@@ -1,183 +1,322 @@
 // Wrapping the whole extension in a JS function
 // (ensures all global variables set in this extension cannot be referenced outside its scope)
-(async function (codioIDE, window) {
+(async function(codioIDE, window) {
 
   // Refer to Anthropic's guide on system prompts here: https://docs.anthropic.com/claude/docs/system-prompts
-  const systemPrompt =
-    "You are a helpful assistant with an expertise at writing alt text for images. Your response must always be in plain English, a sentence or a paragraph of 3-4 sentences, with no new lines and no bullet points.";
+  const systemPrompt = "You are a helpful assistant with an expertise at writing alt text for images. Your response must always be in plain English, a sentence or a paragraph of 3-4 sentences, with no new lines and no bullet points."
 
   // register(id: unique button id, name: name of button visible in Coach, function: function to call when button is clicked)
-  codioIDE.coachBot.register("altTextGenButton", "Generate Alt text for all images", onButtonPress);
+  codioIDE.coachBot.register("altTextGenButton", "Generate Alt text for all images", onButtonPress)
 
+  function getMediaType(filePath) {
+    const baseName = filePath.split(/[\\/]/).pop() || '';
+    const dotIndex = baseName.lastIndexOf('.');
+    const ext = dotIndex >= 0 ? baseName.slice(dotIndex + 1).toLowerCase() : '';
+
+    switch (ext) {
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'png':
+        return 'image/png';
+      case 'gif':
+        return 'image/gif';
+      case 'webp':
+        return 'image/webp';
+      default:
+        throw new Error(`Unsupported image extension: ${ext}`);
+    }
+  }
+
+  const GENERIC_ALT_TERMS = /^(image|img|photo|picture|pic|screenshot|screen shot|figure|fig|graphic|icon|logo|banner|thumbnail|thumb|placeholder|untitled)$/i
+  const FILENAME_PATTERN = /^[\w\-]+\.\w{2,5}$/
+
+  function isMeaningfulAltText(altText) {
+    const trimmed = altText.trim()
+    if (trimmed.length === 0) return false
+    if (trimmed.length < 100) return false
+    if (GENERIC_ALT_TERMS.test(trimmed)) return false
+    if (FILENAME_PATTERN.test(trimmed)) return false
+    return true
+  }
+
+  function isExternalUrl(src) {
+    return /^https?:\/\/|^\/\//.test(src)
+  }
+
+  // Regex patterns for image detection
+  const markdownPattern = /!\[.*?\]\(.*?\)/g
+  const htmlImgPattern = /<img\s+[^>]*?src\s*=\s*(['"])(.*?)\1[^>]*?\/?>/gi
+
+  function normalizeImageMatches(pageContent) {
+    const results = []
+
+    for (const m of pageContent.matchAll(markdownPattern)) {
+      const altMatch = m[0].match(/(?<=\[)(.*?)(?=\])/)
+      const pathMatch = m[0].match(/(?<=\()(.*?)(?=\))/)
+      results.push({
+        originalString: m[0],
+        filepath: pathMatch ? pathMatch[0] : '',
+        existingAltText: altMatch ? altMatch[0].trim() : '',
+        type: 'markdown'
+      })
+    }
+
+    for (const m of pageContent.matchAll(htmlImgPattern)) {
+      const altAttrMatch = m[0].match(/alt\s*=\s*(['"])(.*?)\1/i)
+      results.push({
+        originalString: m[0],
+        filepath: m[2],
+        existingAltText: altAttrMatch ? altAttrMatch[2].trim() : '',
+        type: 'html'
+      })
+    }
+
+    return results
+  }
+
+  function buildReplacement(descriptor, newAltText) {
+    if (descriptor.type === 'markdown') {
+      return `![${newAltText}](${descriptor.filepath})`
+    }
+
+    // HTML img tag
+    const tag = descriptor.originalString
+    if (/alt\s*=\s*(['"]).*?\1/i.test(tag)) {
+      // Replace existing alt attribute value
+      return tag.replace(/alt\s*=\s*(['"]).*?\1/i, `alt="${newAltText}"`)
+    }
+    // Insert alt attribute after <img
+    return tag.replace(/<img/i, `<img alt="${newAltText}"`)
+  }
+
+  // function called when I have a question button is pressed
   async function onButtonPress() {
+
     codioIDE.coachBot.write(`Generating alt text for ya my bestie... give me a sec and I'll get started!`);
+    codioIDE.coachBot.showThinkingAnimation()
 
     // Get guideStructure to extract pages
-    const guidesStructure = await codioIDE.guides.structure.getStructure();
-    console.log("This is the guides structure", guidesStructure);
+    const guidesStructure = await codioIDE.guides.structure.getStructure()
+    console.log("This is the guides structure", guidesStructure)
 
     const findPagesFilter = (obj) => {
-      if (!obj || typeof obj !== "object") return [];
-      return [
-        ...(obj.type === "page" ? [obj] : []),
-        ...Object.values(obj).flatMap(findPagesFilter),
-      ];
+        if (!obj || typeof obj !== 'object') return [];
+
+        return [
+            ...(obj.type === 'page' ? [obj] : []),
+            ...Object.values(obj).flatMap(findPagesFilter)
+        ];
     };
 
-    const pages = findPagesFilter(guidesStructure);
-
-    // Newline-safe markdown image regex:
-    // - matches ![...](path) even if alt text contains newlines
-    // - captures the path in match[1]
-    // - supports optional markdown title: ![alt](path "title")
-    const pattern = /!\[[\s\S]*?\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+    const pages = findPagesFilter(guidesStructure)
+    const totalPages = pages.length
 
     // aws lambda function url
-    const lambdaUrl = "https://wrib7ayaikuoognvwh4xjlqtim0zunnd.lambda-url.us-east-2.on.aws/";
+    const lambdaUrl = 'https://wrib7ayaikuoognvwh4xjlqtim0zunnd.lambda-url.us-east-2.on.aws/';
 
-    // helper: extension -> mime subtype normalization
-    function getFileExtension(filePath) {
-      const baseName = filePath.split(/[\\/]/).pop();
-      const dotIndex = baseName.lastIndexOf(".");
-      return dotIndex >= 0 ? baseName.slice(dotIndex + 1) : "";
-    }
-
-    function normalizeImageSubtype(ext) {
-      let imageType = (ext || "").toLowerCase();
-      if (imageType === "jpg") imageType = "jpeg";
-      if (imageType === "svg") imageType = "svg+xml";
-      if (!imageType) imageType = "png";
-      return imageType;
-    }
-
-    // helper: sanitize model output so it can't break markdown / future parsing
-    function sanitizeAltText(text) {
-      return (text ?? "")
-        .toString()
-        .replace(/[\r\n]+/g, " ")  // remove newlines
-        .replace(/\s+/g, " ")      // collapse whitespace
-        .replace(/[\[\]]/g, "")    // remove square brackets (markdown-structure breakers)
-        .trim();
-    }
+    // Counters for final summary
+    let totalImagesProcessed = 0
+    let totalPagesWithImages = 0
+    let totalImagesSkippedErrors = 0
+    let totalExternallySkipped = 0
 
     // extract page content for each guide page
     for (const element_index in pages) {
-      const pageNumber = parseInt(element_index, 10) + 1;
-      const page_id = pages[element_index].id;
+      let pageNumber = parseInt(element_index, 10) + 1
+      let page_id = pages[element_index].id
+      let pageData = await codioIDE.guides.structure.get(page_id)
+      let pageContent = pageData.settings.content
+      let pageTitle = pages[element_index].title
 
-      const pageData = await codioIDE.guides.structure.get(page_id);
-      let pageContent = pageData.settings.content;
-      const pageTitle = pages[element_index].title;
+      codioIDE.coachBot.hideThinkingAnimation()
+      codioIDE.coachBot.write(`Searching page ${pageNumber} of ${totalPages}: ${pageTitle}`);
+      codioIDE.coachBot.showThinkingAnimation()
 
-      codioIDE.coachBot.write(`Searching on page ${pageNumber}: ${pageTitle}`);
-      console.log(`Searching on page ${pageNumber}: ${pageTitle}`);
+      console.log(`Searching page ${pageNumber} of ${totalPages}: ${pageTitle}`)
 
-      // Search for markdown formatting of images on this page
-      const matches = [...pageContent.matchAll(pattern)];
+      // Search for both markdown and HTML images on this page
+      const matches = normalizeImageMatches(pageContent)
 
       if (matches.length > 0) {
-        console.log("matches object", matches);
+        console.log("matches object", matches)
+
+        codioIDE.coachBot.hideThinkingAnimation()
         codioIDE.coachBot.write(`Found ${matches.length} images on this page!`);
+        codioIDE.coachBot.showThinkingAnimation()
 
-        const alt_text_replacements = [];
+        let alt_text_replacements = []
+        let skippedImages = []
+        let alreadyHadAlt = 0
+        let externallySkipped = 0
 
-        // Process each match, but never fail the whole page if one image errors
-        const results = await Promise.allSettled(
-          matches.map(async (match, idx) => {
-            try {
-              // IMPORTANT FIX: filepath is captured by the regex in match[1]
-              const filepath = (match[1] || "").trim();
-              if (!filepath) {
-                throw new Error("Could not extract image filepath from markdown.");
-              }
+        // for each match, extract filepath and alt text sections
+        await Promise.allSettled(matches.map(async (match, index) => {
+          const matchNumber = index + 1
+          console.log(`This is match object ${matchNumber}: ${match.originalString}`)
+          console.log("Page id with matches: ", page_id)
 
-              // converting img to base64 (this can throw if file not found)
-              const imgFile = await window.codioIDE.files.getFileBase64(filepath);
-
-              const ext = getFileExtension(filepath);
-              const imageSubtype = normalizeImageSubtype(ext);
-
-              const postData = { imgData: imgFile };
-              const options = {
-                method: "POST",
-                body: JSON.stringify(postData),
-              };
-
-              const params = new URLSearchParams({
-                prompt: `This image is on a page titled: ${pageTitle} Provide only the alt text for this image. Respond with clarity and brevity.`,
-                systemPrompt: systemPrompt,
-                mediaType: `image/${imageSubtype}`,
-              });
-
-              const urlWithParams = `${lambdaUrl}?${params.toString()}`;
-
-              const fetchRequest = await fetch(urlWithParams, options);
-              if (!fetchRequest.ok) {
-                throw new Error(`HTTP error! status: ${fetchRequest.status}`);
-              }
-
-              const data = await fetchRequest.json();
-
-              // IMPORTANT FIX: sanitize so alt text can't break markdown on later runs
-              let llmResponse = sanitizeAltText(data.responseText);
-
-              if (!llmResponse) {
-                throw new Error("Empty alt-text returned by model.");
-              }
-
-              alt_text_replacements.push({
-                og_match_string: match[0],
-                updated_with_alt_text: `![${llmResponse}](${filepath})`,
-              });
-
-              return { ok: true, idx, filepath };
-            } catch (error) {
-              console.error(
-                `Alt-text generation failed for image #${idx + 1} on page "${pageTitle}":`,
-                error
-              );
-
-              // Tell the user *which* image failed, but continue processing
-              codioIDE.coachBot.write(
-                `⚠️ Skipping one image on this page (image #${idx + 1}) because of an error: ${error?.message || error}`
-              );
-
-              return { ok: false, idx, error: error?.message || String(error) };
+          try {
+            // Skip externally hosted images
+            if (isExternalUrl(match.filepath)) {
+              console.log(`Image ${matchNumber} is externally hosted, skipping.`)
+              codioIDE.coachBot.hideThinkingAnimation()
+              codioIDE.coachBot.write(`Skipped image ${matchNumber}: externally hosted image (${match.filepath}). Only local workspace images are processed.`);
+              codioIDE.coachBot.showThinkingAnimation()
+              externallySkipped++
+              return
             }
-          })
-        );
 
-        console.log("Promise results (settled)", results);
-        console.log("Here are the alt text replacements", alt_text_replacements);
+            if (isMeaningfulAltText(match.existingAltText)) {
+              console.log(`Image ${matchNumber} already has meaningful alt text, skipping.`)
+              alreadyHadAlt++
+              return
+            }
 
-        // Replace all occurrences of each original match
-        for (const rep of alt_text_replacements) {
-          pageContent = pageContent.split(rep.og_match_string).join(rep.updated_with_alt_text);
+            if (!match.filepath) {
+              throw new Error('Could not extract image filepath.')
+            }
+
+            // converting img to base64
+            const filepath = match.filepath
+            const imgFile = await window.codioIDE.files.getFileBase64(filepath)
+            const mediaType = getMediaType(filepath)
+
+            const postData = {
+              imgData: imgFile
+            };
+
+            const options = {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(postData),
+            };
+
+            const params = new URLSearchParams({
+              prompt: `This image is on a page titled: ${pageTitle}. Provide only the alt text for this image. Respond with clarity and brevity.`,
+              systemPrompt: systemPrompt,
+              mediaType: mediaType
+            });
+
+            console.log("These are the params", params.toString())
+
+            // set up url with query string params
+            const urlWithParams = `${lambdaUrl}?${params.toString()}`;
+
+            // Retry logic: up to 3 attempts for the Lambda call
+            let data = null;
+            const maxRetries = 3;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                const fetchRequest = await fetch(urlWithParams, options);
+
+                if (!fetchRequest.ok) {
+                  const errorText = await fetchRequest.text();
+                  throw new Error(`HTTP ${fetchRequest.status}: ${errorText}`);
+                }
+
+                data = await fetchRequest.json();
+                break; // success, exit retry loop
+              } catch (fetchError) {
+                console.error(`Attempt ${attempt}/${maxRetries} failed for ${filepath}:`, fetchError);
+                if (attempt < maxRetries) {
+                  await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+                } else {
+                  throw fetchError; // all retries exhausted, let outer catch handle it
+                }
+              }
+            }
+
+            const llmResponse = data?.responseText;
+            if (!llmResponse) {
+              throw new Error('Lambda returned no responseText.');
+            }
+
+            alt_text_replacements.push({
+              og_match_string: match.originalString,
+              updated_with_alt_text: buildReplacement(match, llmResponse)
+            });
+
+            codioIDE.coachBot.hideThinkingAnimation()
+            codioIDE.coachBot.write(`Generated alt text for image ${matchNumber} of ${matches.length}`);
+            codioIDE.coachBot.showThinkingAnimation()
+
+          } catch (error) {
+            console.error(`Error processing image ${matchNumber} on page ${pageNumber}:`, error);
+            skippedImages.push(`Image ${matchNumber} (${match.originalString}): ${error.message}`);
+          }
+        }));
+
+        console.log("Here are the alt text replacements", alt_text_replacements)
+
+        // Update counters
+        totalImagesProcessed += alt_text_replacements.length
+        totalImagesSkippedErrors += skippedImages.length
+        totalExternallySkipped += externallySkipped
+        if (alt_text_replacements.length > 0) {
+          totalPagesWithImages++
         }
 
-        console.log("updated page content", pageContent);
-
-        try {
-          console.log("Page id for updates: ", page_id);
-          const updateRes = await window.codioIDE.guides.structure.update(page_id, {
-            title: pageTitle,
-            content: pageContent,
-          });
-          console.log("item updated", updateRes);
-        } catch (e) {
-          console.error(e);
+        // Report skipped images to the user
+        if (skippedImages.length > 0) {
+          codioIDE.coachBot.hideThinkingAnimation()
+          codioIDE.coachBot.write(`Warning: ${skippedImages.length} out of ${matches.length} image(s) on page ${pageNumber} could not be processed:\n${skippedImages.join('\n')}`);
+          codioIDE.coachBot.showThinkingAnimation()
         }
 
-        codioIDE.coachBot.write(`Alt text for images on this page is updated! Moving on...`);
+        // now let's replace the alt text in the original content page and update it
+        for (const match of alt_text_replacements) {
+          pageContent = pageContent.replaceAll(match.og_match_string, match.updated_with_alt_text)
+        }
+        console.log("updated page content", pageContent)
+
+        // Only update the page if we actually made changes
+        if (alt_text_replacements.length > 0) {
+          try {
+            console.log("Page id for updates: ", page_id)
+            const updateRes = await window.codioIDE.guides.structure.update(page_id, {
+              title: pageTitle,
+              content: pageContent
+            })
+            console.log('item updated', updateRes)
+          } catch (e) {
+            console.error(e)
+          }
+        }
+
+        // Conditional success messaging
+        const totalOnPage = matches.length
+        const succeeded = alt_text_replacements.length
+        const skipped = skippedImages.length
+
+        codioIDE.coachBot.hideThinkingAnimation()
+        if (alreadyHadAlt === totalOnPage) {
+          codioIDE.coachBot.write(`All images on this page already have alt text.`);
+        } else if (skipped === 0 && alreadyHadAlt === 0 && externallySkipped === 0) {
+          codioIDE.coachBot.write(`Updated alt text for ${succeeded} image(s) on this page!`);
+        } else if (succeeded > 0) {
+          codioIDE.coachBot.write(`Updated ${succeeded} of ${totalOnPage} image(s) on this page.`);
+        }
+        codioIDE.coachBot.showThinkingAnimation()
+        // If succeeded === 0 and not all already had alt, the warning is sufficient
       } else {
-        console.log("No matches on this page");
-        codioIDE.coachBot.write(`No images here, let's move on...`);
+        console.log("No matches on this page")
       }
     }
 
-    codioIDE.coachBot.write(`All images in this assignment have been processed! 🐣`);
-    codioIDE.coachBot.showMenu();
-  }
+    // Final summary
+    let summary = `Done! Processed ${totalImagesProcessed} image(s) across ${totalPagesWithImages} page(s).`
+    if (totalImagesSkippedErrors > 0) {
+      summary += ` ${totalImagesSkippedErrors} image(s) were skipped due to errors.`
+    }
+    if (totalExternallySkipped > 0) {
+      summary += ` ${totalExternallySkipped} image(s) were skipped because they are externally hosted.`
+    }
 
-  // calling the function immediately by passing the required variables
-})(window.codioIDE, window);
+    codioIDE.coachBot.hideThinkingAnimation()
+    codioIDE.coachBot.write(summary);
+    codioIDE.coachBot.showMenu()
+  }
+// calling the function immediately by passing the required variables
+})(window.codioIDE, window)
